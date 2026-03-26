@@ -76,14 +76,15 @@ def cal_T2T1AM(magn_file, phas_file,mask_file, b1_file, TR, FA, phi, label=None,
         #print(f_phs[i])
         phs_image[i,:] = phas_all[:,:,:,i][mask]
     
-    #experimental compelx signals
+    #experimental complex signals
     complex_signal = mag_image*np.exp(-1.0j*phs_image)
     
     # %% prepare T2 1D matrix
     T1_array = pymp.shared.array((np.sum(mask)), dtype='double')
     T2_array = pymp.shared.array((np.sum(mask)), dtype='double')
     Am_array = pymp.shared.array((np.sum(mask)), dtype='double')
-        
+    progress = pymp.shared.array((1,), dtype='uint32')
+
     start_time = time.time()    
     # %% iterate over voxels (True voxels in mask):
     t1_start = 1000.0
@@ -93,9 +94,12 @@ def cal_T2T1AM(magn_file, phas_file,mask_file, b1_file, TR, FA, phi, label=None,
     x0   = [t1_start, t2_start, amp_scale_start]    #lsq start values  for T1, T2, and amplitude scaling
     bnds = ([1, 1, 1],[10000, 1000, 50000])         #lsq search bounds for T1, T2, and amplitude scaling
         
-        
+    print('num voxels=',np.sum(mask))    
     with pymp.Parallel(16) as p: 
         for i in p.range(0, np.sum(mask)):
+            progress[0] += 1
+            if (np.mod(progress[0], 10) == 0):
+                print('progress: ', progress[0], ' / ', np.sum(mask))
             #for i in p.range(1310, 1312):
             fa = ALPHA[i]
             sig = complex_signal[:, i]
@@ -148,11 +152,11 @@ def cal_T2T1AM(magn_file, phas_file,mask_file, b1_file, TR, FA, phi, label=None,
     
     print('save as', outputpath, outputbasename)
     
-    nib.save(nib.Nifti1Image(T1_test, nii.affine), os.path.abspath(os.path.join(outputpath,'T1_'+outputbasename+'.nii' )))
+    nib.save(nib.Nifti1Image(T1_test, nii.affine), os.path.abspath(os.path.join(outputpath,'T1_'+outputbasename+'.nii.gz' )))
 
-    nib.save(nib.Nifti1Image(T2_test, nii.affine), os.path.abspath(os.path.join(outputpath,'T2_'+outputbasename+'.nii' )))
+    nib.save(nib.Nifti1Image(T2_test, nii.affine), os.path.abspath(os.path.join(outputpath,'T2_'+outputbasename+'.nii.gz' )))
 
-    nib.save(nib.Nifti1Image(Am_test, nii.affine), os.path.abspath(os.path.join(outputpath,'Am_'+outputbasename+'.nii' )))
+    nib.save(nib.Nifti1Image(Am_test, nii.affine), os.path.abspath(os.path.join(outputpath,'Am_'+outputbasename+'.nii.gz' )))
     
     print('done')
     
