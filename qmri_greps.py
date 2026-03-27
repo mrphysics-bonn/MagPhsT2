@@ -149,7 +149,8 @@ def load_data(magn_file, phas_file, mask_file, b1_file, FA, phi):
     
     # load B1 scale factor map
     B1scale = nib.load(b1_file).get_fdata()
-    fa_mask = FA * B1scale[mask]/100.0        # flip angles [deg] as 1D array in mask voxels
+    # flip angles [deg] as 1D array in mask voxels
+    fa_mask = FA * B1scale[mask]/100.0   # assumes B1 map is in percent (e.g. 100 means 100% of nominal flip angle, 110 means 110% of nominal flip angle, etc.)
     
     # load magnitude and phase data
     magn_all = nib.load(magn_file).get_fdata()  #4D array
