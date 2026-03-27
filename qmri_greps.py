@@ -1,11 +1,15 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Feb 22 09:37:05 2023
-Major Revision Sep 2025 
+#
+# Quantitative MR parameter mapping from gradient echo magnitude and phase signals with partial spoiling (GREPS)
+#
+# This code implements T1, T2, and amplitude mapping from GREPS data
+# The modeling uses a pre-computed signal dictionary, i.e. a "system cube" computed with the EPG formalism.  
+# The code uses parallel computing with pymp, nifti file support with nibabel, and fast EPG computations with pyepg.
+#
+# Created on Wed Feb 22 09:37:05 2023
+# @authors: Difei Wang, Tony Stoecker
+# Major Revision Sep 2025 (TS)
+# Minor Revision Mar 2026 (TS)
 
-@authors: Difei Wang, Tony Stoecker
-"""
 import os
 import time
 from datetime import timedelta
@@ -134,66 +138,58 @@ class system_cube:
             print("->DONE in %2.f seconds (%s HMS)" %(delta, timedelta(seconds=delta)))    
 
 
-# Main function to calculate T1, T2, and amplitude maps from GREPS magnitude and phase data, using either EPG or pre-computed system cube for signal modeling
-def cal_T2T1AM(nprocs,magn_file, phas_file,mask_file, b1_file, TR, FA, phi, syscube=None,outputpath='.',outputbasename='result'):
-    
-    #% prepare input data
+# load magnitude, phase, mask, and B1 data from nifti files, and create complex signal array for voxels in mask and all phase increments
+def load_data(magn_file, phas_file, mask_file, b1_file, FA, phi):
+
+    # phase increments as python list or numpy array (expects only positive values, sorted in ascending order, e.g. [1, 1.5, 2, 3, 4, 5]) 
     d_phi = np.array(phi)
-    print('PhaInc list:', d_phi)
-    print('alpha=', FA)
-    print('TR=', TR)    
-    print('mask:', mask_file)
-    #mask
+
+    # get mask
     mask = nib.load(mask_file).get_fdata() >0.5
-    print('========== Total number of voxels: ', np.sum(mask))
     
-    #load B1 scale factor map
-    print('Load B1 map', b1_file)
+    # load B1 scale factor map
     B1scale = nib.load(b1_file).get_fdata()
-    ALPHA = FA * B1scale[mask]/100.0 # [deg], 1D array
+    fa_mask = FA * B1scale[mask]/100.0        # flip angles [deg] as 1D array in mask voxels
     
-    # load magnitude images
-    print('Load magnitude', magn_file)
-    nii = nib.load(magn_file)
-    magn_all = nii.get_fdata().astype(np.float32) #4D array
-    print(magn_all.shape)
+    # load magnitude and phase data
+    magn_all = nib.load(magn_file).get_fdata()  #4D array
+    phas_all = nib.load(phas_file).get_fdata()  #4D array
     
-    # load phase images
-    print('Load phase', phas_file)
-    phas_all = nib.load(phas_file).get_fdata().astype(np.float32) #4D array
-    print(phas_all.shape)
-    
-    T1_map = pymp.shared.array(mask.shape, dtype='double')
-    T2_map = pymp.shared.array(mask.shape, dtype='double')
-    Am_map = pymp.shared.array(mask.shape, dtype='double')
-    
-    # select corresponding phinc MAGNITUDE
-    mag_image = np.zeros((len(d_phi), np.sum(mask)))
+    # create complex signal array for voxels in mask and all phase increments (2D array: n_phase_inc x n_voxels_in_mask)
+    mag = np.zeros((len(d_phi), np.sum(mask)))
+    phs = np.zeros((len(d_phi), np.sum(mask)))
     for i in range(len(d_phi)):
-        mag_image[i,:] = magn_all[:,:,:,i][mask]
-    print(mag_image.shape)
-        
-    # select corresponding phinc PHASE
-    phs_image = np.zeros((len(d_phi), np.sum(mask)))
-    for i in np.arange(len(d_phi)):
-        phs_image[i,:] = phas_all[:,:,:,i][mask]
+        mag[i,:] = magn_all[:,:,:,i][mask]
+        phs[i,:] = phas_all[:,:,:,i][mask]
+    complex_signal = mag*np.exp(-1j*phs)
     
-    #complex signals
-    complex_signal = mag_image*np.exp(-1j*phs_image)
+    return complex_signal, mask, fa_mask, d_phi
+
+
+# Main function to calculate T1, T2, and amplitude maps from GREPS magnitude and phase data, using either EPG or pre-computed system cube for signal modeling
+def param_fit(nprocs,magn_file, phas_file,mask_file, b1_file, TR, FA, phi, syscube=None,outputpath='.',outputbasename='result'):
     
-    # % prepare T2 1D matrix
+    # load data
+    (complex_signal, mask, fa_mask, d_phi) = load_data(magn_file, phas_file, mask_file, b1_file, FA, phi)
+
+    if syscube == None:
+        print('PhaInc list:', d_phi)
+    else:
+        print(syscube)
+
+    # create output volumes and 1D arrays in mask area
+    T1_map   = pymp.shared.array(mask.shape, dtype='double')
+    T2_map   = pymp.shared.array(mask.shape, dtype='double')
+    Am_map   = pymp.shared.array(mask.shape, dtype='double')
     T1_array = pymp.shared.array((np.sum(mask)), dtype='double')
     T2_array = pymp.shared.array((np.sum(mask)), dtype='double')
     Am_array = pymp.shared.array((np.sum(mask)), dtype='double')
     progress = pymp.shared.array((1,), dtype='uint32')
 
-    # % iterate over voxels (True voxels in mask):
-    t1_start = 1000.0
-    t2_start = 80
-    amp_scale_start = 5000
-        
-    x0   = [t1_start, t2_start, amp_scale_start]    #lsq start values  for T1, T2, and amplitude scaling
-    bnds = ([1, 1, 1],[10000, 1000, 50000])         #lsq search bounds for T1, T2, and amplitude scaling
+
+    # % Least squares fit: iterate over voxels in mask
+    x0   = [1000.0, 80.0, 5000.0]            #lsq start values  for T1, T2, and amplitude scaling
+    bnds = ([1, 1, 1],[10000, 1000, 50000])  #lsq search bounds for T1, T2, and amplitude scaling
         
     print('num voxels=',np.sum(mask))    
     with pymp.Parallel(nprocs) as p: 
@@ -201,20 +197,17 @@ def cal_T2T1AM(nprocs,magn_file, phas_file,mask_file, b1_file, TR, FA, phi, sysc
             progress[0] += 1
             if (np.mod(progress[0], 100) == 0):
                 print('progress: ', progress[0], ' / ', np.sum(mask))
-            #for i in p.range(1310, 1312):
-            fa = ALPHA[i]
-            sig = complex_signal[:, i]
+
+            fa  = fa_mask[i]            #flip angle for this voxel from B1 map
+            sig = complex_signal[:, i]  #complex GREPS signal for this voxel across all phase increments
             if syscube == None:
                 args = (fa,TR,d_phi,sig)  
+                fun  = greps_diff_signal_err_least_squares
             else:
                 args = (syscube,fa,d_phi,sig)  
-                
+                fun  = greps_diff_signal_err_lsq_sc
             try:
-                if syscube == None:
-                    res = least_squares(greps_diff_signal_err_least_squares, x0, args=args, bounds=bnds, ftol = 1e-10, xtol = 1e-10, gtol = 1e-10)
-                else:
-                    res = least_squares(greps_diff_signal_err_lsq_sc, x0, args=args, bounds=bnds, ftol = 1e-10, xtol = 1e-10, gtol = 1e-10)
-
+                res = least_squares(fun, x0, args=args, bounds=bnds, ftol = 1e-10, xtol = 1e-10, gtol = 1e-10)
                 #print(res.x[0], res.x[1], res.x[2])
                 T1_array[i] = res.x[0]
                 T2_array[i] = res.x[1]
@@ -225,16 +218,17 @@ def cal_T2T1AM(nprocs,magn_file, phas_file,mask_file, b1_file, TR, FA, phi, sysc
                 T2_array[i] = 10000
                 Am_array[i] = 100000  
         
-    # % prepare T1,T2,PD output nifti images
+    # % copy fit to 3D output volumes
     T1_map[mask] = T1_array
     T2_map[mask] = T2_array
     Am_map[mask] = Am_array
     
         
-    print('save as', outputpath, outputbasename)
-    nib.save(nib.Nifti1Image(T1_map, nii.affine), os.path.abspath(os.path.join(outputpath,'T1_'+outputbasename+'.nii.gz' )))
-    nib.save(nib.Nifti1Image(T2_map, nii.affine), os.path.abspath(os.path.join(outputpath,'T2_'+outputbasename+'.nii.gz' )))
-    nib.save(nib.Nifti1Image(Am_map, nii.affine), os.path.abspath(os.path.join(outputpath,'Am_'+outputbasename+'.nii.gz' )))
+    print('save results in ', outputpath)
+    affine = nib.load(magn_file).affine
+    nib.save(nib.Nifti1Image(T1_map, affine), os.path.abspath(os.path.join(outputpath,'T1_'+outputbasename+'.nii.gz' )))
+    nib.save(nib.Nifti1Image(T2_map, affine), os.path.abspath(os.path.join(outputpath,'T2_'+outputbasename+'.nii.gz' )))
+    nib.save(nib.Nifti1Image(Am_map, affine), os.path.abspath(os.path.join(outputpath,'Am_'+outputbasename+'.nii.gz' )))
     print('done')
     
-    return (complex_signal,T1_array,T2_array,Am_array,ALPHA)
+    return 
